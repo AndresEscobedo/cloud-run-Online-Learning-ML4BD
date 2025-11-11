@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import io
 import pickle
-from datetime import datetime
 from google.cloud import storage
 from river import linear_model, preprocessing, metrics
 
@@ -44,16 +43,16 @@ def load_model_from_gcs(bucket_name, source_blob):
             st.info("Modelo cargado desde GCS.")
             return pickle.loads(data)
         else:
-            st.info("No se encontró un modelo previo, se iniciará uno nuevo.")
+            st.info("ℹNo se encontró un modelo previo, se iniciará uno nuevo.")
             return None
     except Exception as e:
-        st.warning(f"No se pudo cargar el modelo previo: {e}")
+        st.warning(f"⚠️ No se pudo cargar el modelo previo: {e}")
         return None
 
 # =========================================================
 # CONFIGURACIÓN DE PARÁMETROS
 # =========================================================
-bucket_name = st.text_input("Nombre del bucket de GCS:", "bucket_131025")
+bucket_name = st.text_input("Nombre del bucket de GCS:", "mlbd_bucket_131025")
 prefix = st.text_input("Carpeta/prefijo dentro del bucket:", "tlc_yellow_trips_2022/")
 limite = st.number_input("Número de registros por archivo a procesar:", value=1000, step=100)
 mostrar_grafico = st.checkbox("Mostrar gráfico de evolución del R²", value=True)
@@ -75,67 +74,56 @@ model = st.session_state.model
 r2 = st.session_state.metric
 
 # =========================================================
-# EXTRACCIÓN DE PREDICTORES (ROBUSTA A COLUMNAS FALTANTES)
+# EXTRACCIÓN DE PREDICTORES (SOLO CAMBIO DE PREDICTORES)
 # =========================================================
-def parse_pickup_dt(row):
-    # 1) columna pre-derivada si existe
+def _parse_time_fields(row):
+    # 1) pickup_hour si existe
     if "pickup_hour" in row and pd.notna(row["pickup_hour"]):
         try:
-            # puede venir como entero 0-23
-            return None, int(row["pickup_hour"])
+            hour = int(pd.to_numeric(row["pickup_hour"], errors="coerce"))
+            return None, max(0, min(hour, 23))
         except Exception:
             pass
-
-    # 2) intenta con timestamps comunes en TLC
-    for col in ("tpep_pickup_datetime", "lpep_pickup_datetime", "pickup_datetime"):
-        if col in row and pd.notna(row[col]):
-            try:
-                dt = pd.to_datetime(row[col], errors="coerce", utc=False)
-                if pd.notna(dt):
-                    return dt, int(dt.hour)
-            except Exception:
-                continue
+    # 2) timestamps comunes
+    for c in ("tpep_pickup_datetime", "lpep_pickup_datetime", "pickup_datetime"):
+        if c in row and pd.notna(row[c]):
+            dt = pd.to_datetime(row[c], errors="coerce", utc=False)
+            if pd.notna(dt):
+                return dt, int(dt.hour)
     return None, 0
 
-def extract_features(row):
-    # Distancia
+def _extract_x(row):
+    # distancia
     dist = row.get("trip_distance", 0)
-    try:
-        dist = float(dist) if pd.notna(dist) else 0.0
-    except Exception:
-        dist = 0.0
-    # Pasajeros
+    dist = float(pd.to_numeric(dist, errors="coerce")) if pd.notna(dist) else 0.0
+    # pasajeros
     psg = row.get("passenger_count", 0)
-    try:
-        psg = float(psg) if pd.notna(psg) else 0.0
-    except Exception:
-        psg = 0.0
-
-    dt, hour = parse_pickup_dt(row)
-    dow = dt.weekday() if isinstance(dt, pd.Timestamp) else 0
+    psg = float(pd.to_numeric(psg, errors="coerce")) if pd.notna(psg) else 0.0
+    # tiempo
+    dt, hour = _parse_time_fields(row)
+    dow = int(dt.weekday()) if isinstance(dt, pd.Timestamp) else 0
     is_weekend = 1.0 if dow >= 5 else 0.0
-
-    x = {
+    # ensamblado
+    return {
         "dist": dist,
-        "log_dist": np.log1p(dist),
+        "log_dist": float(np.log1p(max(dist, 0.0))),
         "pass": psg,
         "hour": float(hour),
         "dow": float(dow),
         "is_weekend": is_weekend,
     }
-    return x
 
-def valid_target(val):
-    try:
-        y = float(val)
-        if not np.isfinite(y):
-            return None
-        return y
-    except Exception:
+def _valid_target(v):
+    y = pd.to_numeric(v, errors="coerce")
+    if pd.isna(y):
         return None
+    y = float(y)
+    if not np.isfinite(y):
+        return None
+    return y
 
 # =========================================================
-# FUNCIÓN DE STREAMING DESDE GCS
+# FUNCIÓN DE STREAMING DESDE GCS (MISMO FLUJO, NUEVOS PREDICTORES)
 # =========================================================
 def stream_from_bucket(bucket_name, prefix, limite=1000, chunksize=500):
     client = storage.Client()
@@ -153,18 +141,35 @@ def stream_from_bucket(bucket_name, prefix, limite=1000, chunksize=500):
 
             count = 0
             for chunk in pd.read_csv(buffer, chunksize=chunksize, low_memory=False):
-                # iteración fila a fila; cada fila puede tener distinto esquema
+                # Validación mínima de columnas base
+                if not {"trip_distance", "passenger_count", "fare_amount"}.issubset(chunk.columns):
+                    continue
+
+                # Limpieza vectorizada razonable para evitar valores basura
+                for col in ["trip_distance", "passenger_count", "fare_amount"]:
+                    chunk[col] = pd.to_numeric(chunk[col], errors="coerce")
+
+                chunk = chunk.replace([np.inf, -np.inf], np.nan).dropna(subset=["trip_distance", "passenger_count", "fare_amount"])
+                chunk = chunk[
+                    chunk["fare_amount"].between(2, 200)
+                    & chunk["trip_distance"].between(0.1, 50)
+                    & chunk["passenger_count"].between(1, 6)
+                ]
+
+                if chunk.empty:
+                    continue
+
                 for _, row in chunk.iterrows():
                     if count >= limite:
                         break
 
-                    y = valid_target(row.get("fare_amount"))
+                    y = _valid_target(row.get("fare_amount"))
                     if y is None:
                         continue
 
-                    x = extract_features(row)
+                    x = _extract_x(row)
 
-                    # reglas simples anti-basura
+                    # filtros finales
                     if x["dist"] < 0 or x["dist"] > 200:
                         continue
 
@@ -186,13 +191,13 @@ def stream_from_bucket(bucket_name, prefix, limite=1000, chunksize=500):
 # BOTÓN DE ACTUALIZACIÓN DEL MODELO
 # =========================================================
 if st.button("Actualizar modelo con datos del bucket"):
-    st.info("Procesando archivos desde el bucket...")
+    st.info("Procesando archivos desde el bucket... esto puede tardar unos minutos")
 
     progreso = st.progress(0)
     nombres, valores = [], []
 
     blobs = list(storage.Client().bucket(bucket_name).list_blobs(prefix=prefix))
-    total = max(len(blobs), 1)
+    total = len(blobs) if len(blobs) > 0 else 1
     for i, (fname, score) in enumerate(stream_from_bucket(bucket_name, prefix, limite)):
         nombres.append(fname.split("/")[-1])
         valores.append(score)
@@ -201,7 +206,9 @@ if st.button("Actualizar modelo con datos del bucket"):
         st.write(f"{fname} — R² acumulado: **{score:.3f}**")
 
     progreso.empty()
-    st.success("Entrenamiento incremental completado.")
+    st.success("¡Entrenamiento incremental completado!")
+
+    # Guardar modelo actualizado en GCS
     save_model_to_gcs(model, bucket_name, MODEL_PATH)
 
     if mostrar_grafico and valores:
