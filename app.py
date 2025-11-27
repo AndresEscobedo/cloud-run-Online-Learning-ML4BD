@@ -35,13 +35,11 @@ def load_model_from_gcs(bucket_name, source_blob):
         client = storage.Client()
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(source_blob)
-
         if blob.exists():
             data = blob.download_as_bytes()
             st.info("Modelo cargado desde GCS.")
             return pickle.loads(data)
         return None
-
     except Exception as e:
         st.warning(f"No se pudo cargar el modelo previo: {e}")
         return None
@@ -62,29 +60,35 @@ if "model" not in st.session_state:
     model = load_model_from_gcs(bucket_name, MODEL_PATH)
     if model is None:
         model = preprocessing.StandardScaler() | linear_model.LinearRegression()
-
     st.session_state.model = model
     st.session_state.metric = metrics.R2()
     st.session_state.history = []
-
-    # lista de archivos del bucket e índice actual
     st.session_state.blobs = None
     st.session_state.index = 0
+    # recordar últimos parámetros para resetear cache al cambiarlos
+    st.session_state._last_bucket = bucket_name
+    st.session_state._last_prefix = prefix
+
+# resetear cache si cambian bucket/prefix
+if (st.session_state.get("_last_bucket") != bucket_name) or (st.session_state.get("_last_prefix") != prefix):
+    st.session_state.blobs = None
+    st.session_state.index = 0
+    st.session_state._last_bucket = bucket_name
+    st.session_state._last_prefix = prefix
 
 model = st.session_state.model
 metric = st.session_state.metric
 
 # =========================================================
-# FEATURE ENGINEERING (idéntico al estudiante)
+# FEATURE ENGINEERING
 # =========================================================
 def _parse_time_fields(row):
     if "pickup_hour" in row and pd.notna(row["pickup_hour"]):
         try:
             hour = int(pd.to_numeric(row["pickup_hour"], errors="coerce"))
             return None, max(0, min(hour, 23))
-        except:
+        except Exception:
             pass
-
     for c in ("tpep_pickup_datetime", "lpep_pickup_datetime", "pickup_datetime"):
         if c in row and pd.notna(row[c]):
             dt = pd.to_datetime(row[c], errors="coerce", utc=False)
@@ -92,17 +96,21 @@ def _parse_time_fields(row):
                 return dt, int(dt.hour)
     return None, 0
 
-def _extract_x(row):
-    dist = float(pd.to_numeric(row.get("trip_distance", 0), errors="coerce") or 0)
-    psg  = float(pd.to_numeric(row.get("passenger_count", 0), errors="coerce") or 0)
+def _safe_float(x, default=0.0):
+    v = pd.to_numeric(x, errors="coerce")
+    if pd.isna(v) or not np.isfinite(v):
+        return float(default)
+    return float(v)
 
+def _extract_x(row):
+    dist = _safe_float(row.get("trip_distance", 0.0), 0.0)
+    psg  = _safe_float(row.get("passenger_count", 0.0), 0.0)
     dt, hour = _parse_time_fields(row)
     dow = int(dt.weekday()) if isinstance(dt, pd.Timestamp) else 0
     weekend = 1.0 if dow >= 5 else 0.0
-
     return {
         "dist": dist,
-        "log_dist": float(np.log1p(max(dist, 0))),
+        "log_dist": float(np.log1p(max(dist, 0.0))),
         "pass": psg,
         "hour": float(hour),
         "dow": float(dow),
@@ -111,90 +119,79 @@ def _extract_x(row):
 
 def _valid_target(v):
     y = pd.to_numeric(v, errors="coerce")
-    if pd.isna(y):
+    if pd.isna(y) or not np.isfinite(y):
         return None
     return float(y)
 
 # =========================================================
-# PROCESAR UN SOLO ARCHIVO (MISMA LÓGICA DEL ESTUDIANTE)
+# PROCESAR UN SOLO ARCHIVO
 # =========================================================
 def process_single_blob(bucket_name, blob_name, limite=1000, chunksize=500):
-
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
-
     try:
         content = blob.download_as_bytes()
         buffer = io.BytesIO(content)
         count = 0
-
         for chunk in pd.read_csv(buffer, chunksize=chunksize, low_memory=False):
-
-            if not {"trip_distance","passenger_count","fare_amount"}.issubset(chunk.columns):
+            # columnas mínimas
+            if not {"trip_distance", "passenger_count", "fare_amount"}.issubset(chunk.columns):
                 continue
-
-            for col in ["trip_distance","passenger_count","fare_amount"]:
+            # coerción numérica
+            for col in ["trip_distance", "passenger_count", "fare_amount"]:
                 chunk[col] = pd.to_numeric(chunk[col], errors="coerce")
-
-            chunk = chunk.replace([np.inf, -np.inf], np.nan).dropna()
+            # limpiar solo lo necesario (no descartar por timestamps faltantes)
+            chunk = chunk.replace([np.inf, -np.inf], np.nan).dropna(subset=["trip_distance", "passenger_count", "fare_amount"])
             chunk = chunk[
-                chunk["fare_amount"].between(2,200) &
-                chunk["trip_distance"].between(0.1,50) &
-                chunk["passenger_count"].between(1,6)
+                chunk["fare_amount"].between(2, 200)
+                & chunk["trip_distance"].between(0.1, 50)
+                & chunk["passenger_count"].between(1, 6)
             ]
-
+            if chunk.empty:
+                continue
             for _, row in chunk.iterrows():
                 if count >= limite:
                     break
-
                 y = _valid_target(row["fare_amount"])
                 if y is None:
                     continue
-
                 x = _extract_x(row)
-
+                if x["dist"] < 0 or x["dist"] > 200:
+                    continue
                 pred = model.predict_one(x)
                 model.learn_one(x, y)
                 metric.update(y, pred)
-
                 count += 1
-
     except Exception as e:
         st.warning(f"Error en {blob_name}: {e}")
         return None
-
     return metric.get()
 
 # =========================================================
 # BOTÓN: PROCESAR SIGUIENTE ARCHIVO
 # =========================================================
 if st.button("Procesar siguiente archivo"):
-
     if st.session_state.blobs is None:
         client = storage.Client()
         bucket = client.bucket(bucket_name)
-        st.session_state.blobs = list(bucket.list_blobs(prefix=prefix))
+        # orden determinista
+        st.session_state.blobs = sorted(list(bucket.list_blobs(prefix=prefix)), key=lambda b: b.name)
         st.session_state.index = 0
         st.info(f"Se encontraron {len(st.session_state.blobs)} archivos.")
-
     blobs = st.session_state.blobs
     idx = st.session_state.index
-
     if idx >= len(blobs):
         st.success("Todos los archivos ya fueron procesados.")
     else:
         blob = blobs[idx]
         short = blob.name.split("/")[-1]
         st.write(f"Procesando {idx+1}/{len(blobs)}: `{short}`")
-
         score = process_single_blob(bucket_name, blob.name, int(limite))
-
         if score is not None:
             st.session_state.history.append(score)
             st.write(f"{blob.name} — R² acumulado: **{score:.3f}**")
             save_model_to_gcs(model, bucket_name, MODEL_PATH)
-
         st.session_state.index += 1
 
 # =========================================================
@@ -203,9 +200,6 @@ if st.button("Procesar siguiente archivo"):
 st.markdown("---")
 st.subheader("Estado actual del modelo")
 st.write(f"R² actual: **{metric.get():.3f}**")
-
 if st.session_state.history:
     st.line_chart(st.session_state.history)
-
-
 st.caption("Cloud Run + River • Dataset público de taxis NYC (2022)_221125")
